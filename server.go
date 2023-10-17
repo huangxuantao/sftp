@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ type Server struct {
 	openFilesLock sync.RWMutex
 	handleCount   int
 	workDir       string
+	rootDir       string
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -139,6 +141,15 @@ func WithServerWorkingDirectory(workDir string) ServerOption {
 	}
 }
 
+// WithServerRootDirectory configures the root directory of a Server.
+// Files will not be served outside this directory.
+func WithServerRootDirectory(root string) ServerOption {
+	return func(s *Server) error {
+		s.rootDir, _ = filepath.Abs(root)
+		return nil
+	}
+}
+
 type rxPacket struct {
 	pktType  fxp
 	pktBytes []byte
@@ -147,20 +158,41 @@ type rxPacket struct {
 // Up to N parallel servers
 func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 	for pkt := range pktChan {
+		// permission checks
+		permission := true
+		if stat, err := os.Stat(svr.rootDir); err == nil && stat.IsDir() {
+			switch pkt := pkt.requestPacket.(type) {
+			case *sshFxpRenamePacket:
+				old, e := filepath.Abs(pkt.Oldpath)
+				new, e2 := filepath.Abs(pkt.Newpath)
+				permission = e == nil && e2 == nil && strings.Index(old, svr.rootDir) == 0 && strings.Index(new, svr.rootDir) == 0
+			case *sshFxpSymlinkPacket:
+				old, e := filepath.Abs(pkt.Targetpath)
+				new, e2 := filepath.Abs(pkt.Linkpath)
+				permission = e == nil && e2 == nil && strings.Index(old, svr.rootDir) == 0 && strings.Index(new, svr.rootDir) == 0
+			case hasPath:
+				path, e := filepath.Abs(pkt.getPath())
+				permission = e == nil && strings.Index(path, svr.rootDir) == 0
+			}
+		}
+
 		// readonly checks
 		readonly := true
-		switch pkt := pkt.requestPacket.(type) {
-		case notReadOnly:
-			readonly = false
-		case *sshFxpOpenPacket:
-			readonly = pkt.readonly()
-		case *sshFxpExtendedPacket:
-			readonly = pkt.readonly()
+		if permission {
+			switch pkt := pkt.requestPacket.(type) {
+			case notReadOnly:
+				readonly = false
+			case *sshFxpOpenPacket:
+				readonly = pkt.readonly()
+			case *sshFxpExtendedPacket:
+				readonly = pkt.readonly()
+			}
 		}
 
 		// If server is operating read-only and a write operation is requested,
+		// or a restricted file is requested directly or by action,
 		// return permission denied
-		if !readonly && svr.readOnly {
+		if !permission || (!readonly && svr.readOnly) {
 			svr.pktMgr.readyPacket(
 				svr.pktMgr.newOrderedResponse(statusFromError(pkt.id(), syscall.EPERM), pkt.orderID()),
 			)
